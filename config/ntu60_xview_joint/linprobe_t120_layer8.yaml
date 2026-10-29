@@ -1,7 +1,7 @@
 # data
 feeder: feeder.feeder_ntu.Feeder
 train_feeder_args:
-  data_path: data/ntu/NTU60_XView.npz
+  data_path: ../data/MAMP/ntu/NTU60_XView.npz
   split: train
   debug: False
   random_choose: False
@@ -15,7 +15,7 @@ train_feeder_args:
   bone: False
 
 val_feeder_args:
-  data_path: data/ntu/NTU60_XView.npz
+  data_path: ../data/MAMP/ntu/NTU60_XView.npz
   split: test  
   debug: False
   window_size: 120
@@ -27,7 +27,7 @@ val_feeder_args:
 model: model.transformer.Transformer
 model_args:
   dim_in: 3
-  num_classes: 120
+  num_classes: 60
   dim_feat: 256
   depth: 8
   num_heads: 8

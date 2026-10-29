@@ -1,0 +1,30 @@
+{
+  "protocol": "NTU-60 X-sub",
+  "protocol_source": "conversation context; JSON logs do not encode the protocol or full launch arguments",
+  "source_logs": [
+    {
+      "stage": "pt",
+      "path": "C:\\Users\\97537\\.codex\\attachments\\9546c21d-4f41-4df8-b9e5-37ad78157f0a\\已粘贴的文本.txt",
+      "sha256": "663693c093083ba483930af1148172c734d15d8706d9b3a9e1e9abd38b25337f"
+    },
+    {
+      "stage": "lp",
+      "path": "C:\\Users\\97537\\.codex\\attachments\\7f1ac5f6-53af-452a-a27e-0aebfa310c50\\已粘贴的文本.txt",
+      "sha256": "d2d8e6281a3d0dedfd446282dae46b67d74f2a136e46e8b250618efde4ea6b13"
+    }
+  ],
+  "pretraining": {
+    "epochs": 400,
+    "last_epoch": 399,
+    "first_loss": 0.4129625099440352,
+    "last_loss": 0.2434731974793128
+  },
+  "linear_probe": {
+    "epochs": 100,
+    "best_acc1": 84.940562850234,
+    "best_epoch": 95,
+    "last_acc1": 84.78893742568282,
+    "last_epoch": 99,
+    "n_parameters": 15420
+  }
+}

@@ -24,6 +24,9 @@ def train_one_epoch(model: torch.nn.Module,
                     log_writer=None,
                     args=None):
     model.train(True)
+    model_without_ddp = model.module if hasattr(model, 'module') else model
+    if hasattr(model_without_ddp, 'begin_pretrain_epoch'):
+        model_without_ddp.begin_pretrain_epoch()
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
@@ -57,14 +60,22 @@ def train_one_epoch(model: torch.nn.Module,
             sys.exit(11)
 
         loss /= accum_iter
+        accumulation_boundary = (data_iter_step + 1) % accum_iter == 0
+        commit_pretraining = getattr(model_without_ddp, 'after_optimizer_step', None)
+        scale_before = loss_scaler._scaler.get_scale() if (
+            accumulation_boundary and commit_pretraining is not None) else None
         loss_scaler(loss, optimizer, parameters=model.parameters(),
                     update_grad=(data_iter_step + 1) % accum_iter == 0)
         if (data_iter_step + 1) % accum_iter == 0:
+            if commit_pretraining is not None:
+                commit_pretraining(loss_scaler._scaler.get_scale() >= scale_before)
             optimizer.zero_grad()
 
         torch.cuda.synchronize()
 
         metric_logger.update(loss=loss_value)
+        if hasattr(model_without_ddp, 'pretrain_metrics'):
+            metric_logger.update(**model_without_ddp.pretrain_metrics())
 
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)

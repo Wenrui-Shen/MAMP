@@ -1,7 +1,7 @@
 # data
 feeder: feeder.feeder_ntu.Feeder
 train_feeder_args:
-  data_path: data/ntu120/NTU120_XSet.npz
+  data_path: ../data/MAMP/ntu120/NTU120_XSet.npz
   split: train
   debug: False
   random_choose: False

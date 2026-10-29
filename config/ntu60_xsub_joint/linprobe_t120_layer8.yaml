@@ -1,7 +1,7 @@
 # data
 feeder: feeder.feeder_ntu.Feeder
 train_feeder_args:
-  data_path: data/ntu/NTU60_XSub.npz
+  data_path: ../data/MAMP/ntu/NTU60_XSub.npz
   split: train
   debug: False
   random_choose: False
@@ -15,7 +15,7 @@ train_feeder_args:
   bone: False
 
 val_feeder_args:
-  data_path: data/ntu/NTU60_XSub.npz
+  data_path: ../data/MAMP/ntu/NTU60_XSub.npz
   split: test  
   debug: False
   window_size: 120

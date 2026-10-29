@@ -1,7 +1,7 @@
 # data
 feeder: feeder.feeder_ntu.Feeder
 train_feeder_args:
-  data_path: data/pku_v1/PKUv1_XSub.npz
+  data_path: ../data/MAMP/pku_v1/PKUv1_XSub.npz
   split: train
   debug: False
   random_choose: False
