@@ -56,11 +56,14 @@ def _ddp_worker(rank, store_path):
         optimizer = torch.optim.SGD(wrapped.parameters(), lr=.01)
         for step in range(2):
             optimizer.zero_grad()
-            loss, _, _ = wrapped(inputs(), mask_ratio=.5, motion_aware_tau=0.)
+            data = inputs()
+            if rank == 0:
+                data[0, :, :, :, 1] = 0
+            loss, _, _ = wrapped(data, mask_ratio=.5, motion_aware_tau=0.)
             loss.backward()
             optimizer.step()
             model.after_optimizer_step(True)
-            assert model.contrast_queue_count.item() == (step + 1) * 4
+            assert model.contrast_queue_count.item() == min((step + 1) * 7, 8)
             assert model.teacher_updates.item() == step + 1
             if step:
                 assert model.pretrain_metrics()['loss_contrastive'].item() > 0
@@ -160,7 +163,7 @@ class TargetTests(unittest.TestCase):
 
 
 class ContrastiveTests(unittest.TestCase):
-    def test_full_teacher_and_person_pooling_with_chunks(self):
+    def test_full_teacher_per_skeleton_with_chunks(self):
         model = cl_model()
         model.train()
         self.assertFalse(model.ema_teacher.training)
@@ -169,25 +172,25 @@ class ContrastiveTests(unittest.TestCase):
         token_counts = []
         handle = model.ema_teacher.blocks[0].register_forward_pre_hook(
             lambda _, args: token_counts.append(args[0].shape[1]))
-        chunked = model.teacher_features(flat, 2, 2)
+        chunked = model.teacher_features(flat)
         handle.remove()
         self.assertEqual(token_counts, [8, 8, 8, 8])
         model.teacher_batch_size = 16
-        whole = model.teacher_features(flat, 2, 2)
-        self.assertEqual(tuple(chunked.shape), (2, 16))
+        whole = model.teacher_features(flat)
+        self.assertEqual(tuple(chunked.shape), (4, 16))
         self.assertTrue(torch.allclose(chunked, whole, atol=1.e-6, rtol=1.e-5))
         self.assertFalse(chunked.requires_grad)
 
     def test_cl_uses_cosine_infonce_and_only_encoder_gradients(self):
         model = cl_model(contrast_temperature=.2)
         latent = torch.randn(4, 3, 16, requires_grad=True)
-        keys = torch.nn.functional.normalize(torch.randn(2, 16), dim=-1)
+        keys = torch.nn.functional.normalize(torch.randn(4, 16), dim=-1)
         negatives = torch.nn.functional.normalize(torch.randn(5, 16), dim=-1)
         model._enqueue(negatives)
-        queries = torch.nn.functional.normalize(latent.reshape(2, 2, 3, 16).mean(dim=(1, 2)), dim=-1)
+        queries = torch.nn.functional.normalize(latent.mean(dim=1), dim=-1)
         scores = torch.cat(((queries * keys).sum(-1, keepdim=True), queries @ negatives.T), 1) / .2
         expected = -(scores[:, 0] - torch.logsumexp(scores, dim=1)).mean()
-        actual = model.contrastive_loss(latent, keys, 2, 2)
+        actual = model.contrastive_loss(latent, keys)
         self.assertTrue(torch.allclose(actual, expected))
         actual.backward()
         self.assertGreater(latent.grad.abs().sum().item(), 0.)
@@ -196,14 +199,18 @@ class ContrastiveTests(unittest.TestCase):
         model = cl_model()
         model._enqueue(torch.nn.functional.normalize(torch.randn(3, 16), dim=-1))
         queue = model.contrast_queue.clone()
-        loss, _, _ = model(inputs(), mask_ratio=.5, motion_aware_tau=0.)
+        data = inputs()
+        data[0, :, :, :, 1] = 0
+        loss, prediction, mask = model(data, mask_ratio=.5, motion_aware_tau=0.)
+        self.assertEqual(prediction.shape[0], 3)
+        self.assertEqual(mask.shape[0], 3)
         loss.backward()
         self.assertTrue(torch.equal(queue, model.contrast_queue))
         self.assertGreater(model.blocks[0].attn.qkv.weight.grad.abs().sum().item(), 0.)
         self.assertGreater(model.decoder_pred.weight.grad.abs().sum().item(), 0.)
         self.assertTrue(all(p.grad is None for p in model.ema_teacher.parameters()))
         model.after_optimizer_step(True)
-        self.assertEqual(model.contrast_queue_count.item(), 5)
+        self.assertEqual(model.contrast_queue_count.item(), 6)
         self.assertEqual(model.teacher_updates.item(), 1)
 
     def test_ema_update_happens_after_successful_optimizer_step(self):
@@ -234,7 +241,7 @@ class ContrastiveTests(unittest.TestCase):
             (loss / 2).backward()
         self.assertEqual(model.contrast_queue_count.item(), 0)
         model.after_optimizer_step(True)
-        self.assertEqual(model.contrast_queue_count.item(), 4)
+        self.assertEqual(model.contrast_queue_count.item(), 8)
         self.assertEqual(model.teacher_updates.item(), 1)
 
     def test_epoch_start_discards_incomplete_accumulation_keys(self):
@@ -341,7 +348,7 @@ class EngineTests(unittest.TestCase):
 
     def test_real_engine_commits_at_accumulation_boundary(self):
         model = self.run_engine(False, 2)
-        self.assertEqual(model.contrast_queue_count.item(), 4)
+        self.assertEqual(model.contrast_queue_count.item(), 8)
         self.assertEqual(model.teacher_updates.item(), 1)
 
     def test_real_engine_does_not_commit_on_scaler_skip(self):

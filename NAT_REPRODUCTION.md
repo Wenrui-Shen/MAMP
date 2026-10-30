@@ -31,15 +31,19 @@ The already supplied baseline normally does not need to be run again.
 All four configurations preserve the validated MAMP NTU-60 X-sub protocol:
 8 encoder + 3 decoder layers, encoder/decoder width 256, 8 heads, 120 frames,
 4-frame temporal patches, 25 joints, 90% masking, motion-aware tau 0.8,
-both people including padding, crop [0.5, 1], random rotation enabled,
+crop [0.5, 1], random rotation enabled,
 400 PT epochs, warmup 20, AdamW, LR 0.001 -> 0.0005, weight decay 0.05,
 seed 0, two GPUs, 32 videos per GPU, accumulation 1, autocast disabled.
 
 LP uses the existing native `linprobe_t120_layer8.yaml`: frozen online encoder,
 native 256 -> 60 linear head, 100 epochs, 128 videos per GPU (256 total),
 SGD LR 0.1 -> 0, evaluation crop [0.95], seed 0, `--dist_eval`.
-No empty-person filtering, input normalization, new augmentation, projector,
-alternative LP head, or modified LR schedule is introduced.
+NAT pretraining now removes all-zero person slots before either encoder or the
+decoder and treats every remaining skeleton as a separate training instance.
+The original `motion_patch` model and downstream LP keep native person handling.
+This adds a person-handling difference when comparing NAT runs with that baseline.
+No input normalization, new augmentation, projector, alternative LP head, or
+modified LR schedule is introduced.
 
 `joint_patch` intentionally uses the same MAMP masking as the motion control.
 Using the existing MAE model would also change masking to random, confounding
@@ -48,7 +52,8 @@ native MAMP, and the joint/patch path against native MAE with random masking.
 
 ## NAT implementation
 
-Original target patches have shape `[N*M, 750, 12]`. Original normalization
+Target patches have shape `[K, 750, 12]`, where K is the number of nonempty
+skeleton sequences in the batch. Original normalization
 mixes 4 timestamps and 3 coordinates in the last dimension. For NAT, reshape
 each token into `[4, 1, 3]`, and calculate mean/variance **only over the
 4 timestamps**, independently for every joint and x/y/z coordinate (paper Eq. 5).
@@ -57,8 +62,9 @@ average over the 12 prediction coordinates, then average over masked tokens.
 The paper's vector-valued Eq. 7 does not spell out coordinate-wise reduction;
 this choice preserves the validated MAMP reconstruction loss scale.
 
-This changes only the reconstruction target. Feeder `normalization` remains
-False, and the input to the embedding/encoder is unchanged. For example, large
+NAT changes only the reconstruction target; empty-slot filtering is a separate
+pretraining change. Feeder `normalization` remains False, and retained skeleton
+coordinates are unchanged. For example, large
 coordinate-dependent offsets disappear under NAT, whereas they can dominate
 the original coordinate-mixed target normalization.
 
@@ -86,17 +92,18 @@ Implementation choices where the paper is not explicit:
 - Initialize the teacher by copying the online encoder, freeze its parameters,
   keep it in eval mode, and evaluate it under `no_grad`. EMA updates are specified
   by the paper; exact initialization and these execution-mode details are not.
-- One contrastive instance per video: average its two people's pooled features,
-  matching native MAMP LP. Do not treat empty-person padding as independent
-  contrastive instances. L2 normalization is applied after pooling, with epsilon
-  `1e-6`. The paper does not describe its multi-person pooling or cosine epsilon.
+- One contrastive instance per nonempty skeleton: GAP only over tokens, without
+  averaging people. The masked online feature and full teacher feature of the
+  same skeleton form a positive pair. L2 normalization follows GAP, with epsilon
+  `1e-6`. Empty slots contribute neither reconstruction nor contrastive loss.
 - Start the queue empty and enqueue actual teacher features; the first optimizer
   window has zero CL loss. No random initial negatives or sample-ID exclusion
   are added. Previous samples remain negatives as in a plain FIFO queue.
 - Update the teacher and enqueue gathered keys only after a successful optimizer
   step. With accumulation, commit once per complete window. Scaler-skipped steps
   and discarded trailing windows do not advance teacher/queue state. All ranks
-  gather keys in rank order, giving identical queues.
+  gather variable-length keys in rank order, giving identical queues. DDP losses
+  are weighted by valid skeleton count to preserve a global per-skeleton mean.
 - `teacher_batch_size: 8` chunks the no-grad teacher over person sequences before
   the online forward. Eval-mode LayerNorm makes chunked features equivalent to
   a full teacher batch within floating-point tolerance, while reducing peak
@@ -105,11 +112,13 @@ Implementation choices where the paper is not explicit:
   accumulation, world size and schedule. An ablation change needs a new run.
   Full teacher/queue state is saved in the regular checkpoint. As in native
   MAMP, RNG states are not checkpointed, so resume is not bitwise reproducible.
+  Start a fresh run for the new person handling; do not resume an old video-level
+  CL checkpoint into the skeleton-level queue.
 
 The paper says that other hyperparameters follow MAMP, without publishing all
 details in its main text. In particular, it does not settle the official MAMP
 3-vs-5 decoder discrepancy or explicitly specify its masking tau. We keep the
-already reproduced **8+3/tau0.8/two-person** setup to isolate the changes.
+already reproduced **8+3/tau0.8** setup, with the person handling described above.
 Thus these are controlled reproductions of the paper's mechanisms, not a claim
 of exact equivalence to unretrieved author training code. PT batch total 64 is
 the user's validated setup; the paper's stated LP batch 256 is matched.
@@ -187,8 +196,10 @@ The second command includes a real two-process CPU Gloo check, including a
 second update with a populated negative queue. Local testing
 uses a temporary torch 2.5.1 CPU installation and a test-only `torch._six` shim
 when executing the unchanged torch-1.8-era training utilities. New production
-code retains Python 3.8 and torch 1.8 APIs. All 25 tests passed locally, including
-the two-process check; Python 3.8 syntax, Bash syntax, and diff checks also passed.
+code retains Python 3.8 and torch 1.8 APIs. After the person-handling change,
+test expectations cover per-skeleton queue counts, empty-slot removal, and
+different valid skeleton counts across ranks; runtime checks need the training
+environment because the current local Python does not have PyTorch installed.
 No new 400-epoch training or GPU accuracy result is claimed.
 The local machine lacks the prepared NTU dataset and has a 10 GiB GPU, so
 full NTU-60 runs must be performed in the existing training environment.

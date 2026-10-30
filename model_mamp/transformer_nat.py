@@ -1,8 +1,8 @@
 """Controlled joint/motion reconstruction and NAT + InfoNCE experiments.
 
 NAT follows Gong et al., AAAI 2025, Eq. (5): normalize each coordinate
-of each joint over the timestamps inside one temporal patch. The input,
-masking, two-person handling, and downstream encoder keys stay native.
+of each joint over the timestamps inside one temporal patch. Empty person
+slots are removed before reconstruction and per-skeleton contrastive learning.
 """
 import copy
 import math
@@ -131,26 +131,22 @@ class Transformer(MAMPTransformer):
             self.joints_embed.proj.in_channels, self.target_normalization)
 
     @torch.no_grad()
-    def teacher_features(self, x, videos, people):
+    def teacher_features(self, x):
         # Process full contexts before the online forward. With LayerNorm and
-        # an eval-mode teacher, chunking preserves the per-video features.
+        # an eval-mode teacher, chunking preserves the per-skeleton features.
         features = torch.cat([
             self.ema_teacher(chunk) for chunk in x.split(self.teacher_batch_size)
         ], dim=0)
-        # One key per video. Pool both people just as the native LP head does;
-        # do not turn empty-person padding into separate contrastive instances.
-        features = features.reshape(videos, people, -1).mean(dim=1)
         return F.normalize(features, dim=-1, eps=1.e-6)
 
-    def contrastive_loss(self, latent, keys, videos, people):
+    def contrastive_loss(self, latent, keys):
         with torch.cuda.amp.autocast(enabled=False):
-            queries = latent.float().reshape(videos, people, latent.shape[1], -1)
-            queries = F.normalize(queries.mean(dim=(1, 2)), dim=-1, eps=1.e-6)
+            queries = F.normalize(latent.float().mean(dim=1), dim=-1, eps=1.e-6)
             positive = (queries * keys.detach()).sum(dim=-1, keepdim=True)
             count = int(self.contrast_queue_count.item())
             negatives = queries @ self.contrast_queue[:count].detach().T
             logits = torch.cat((positive, negatives), dim=1) / self.contrast_temperature
-            labels = torch.zeros(videos, device=queries.device, dtype=torch.long)
+            labels = torch.zeros(queries.shape[0], device=queries.device, dtype=torch.long)
             return F.cross_entropy(logits, labels)
 
     @torch.no_grad()
@@ -179,9 +175,15 @@ class Transformer(MAMPTransformer):
         if not successful:
             return
         if dist.is_available() and dist.is_initialized():
-            gathered = [torch.empty_like(keys) for _ in range(dist.get_world_size())]
-            dist.all_gather(gathered, keys)
-            keys = torch.cat(gathered, dim=0)
+            # Filtering leaves different numbers of skeletons on each rank.
+            size = torch.tensor([keys.shape[0]], device=keys.device, dtype=torch.long)
+            sizes = [torch.empty_like(size) for _ in range(dist.get_world_size())]
+            dist.all_gather(sizes, size)
+            sizes = [int(size.item()) for size in sizes]
+            padded = F.pad(keys, (0, 0, 0, max(sizes) - keys.shape[0]))
+            gathered = [torch.empty_like(padded) for _ in sizes]
+            dist.all_gather(gathered, padded)
+            keys = torch.cat([part[:size] for part, size in zip(gathered, sizes)], dim=0)
         # Mutate the queue after backward, avoiding autograd version errors.
         self._enqueue(keys)
         self.ema_teacher.update_from(self, self.ema_momentum)
@@ -206,7 +208,10 @@ class Transformer(MAMPTransformer):
             raise ValueError('Reconstruction requires 0 < mask_ratio < 1')
         videos, channels, frames, joints, people = x.shape
         x = x.permute(0, 4, 2, 3, 1).contiguous().view(videos * people, frames, joints, channels)
-        keys = self.teacher_features(x, videos, people) if self.contrastive_weight else None
+        x = x[x.ne(0).flatten(1).any(dim=1)]
+        if x.shape[0] == 0:
+            raise ValueError('Batch contains no valid skeletons')
+        keys = self.teacher_features(x) if self.contrastive_weight else None
         target = self.make_reconstruction_target(x, motion_stride)
         latent, mask, ids_restore = self.forward_encoder(x, mask_ratio, motion_aware_tau)
         prediction = self.forward_decoder(latent, ids_restore)
@@ -214,9 +219,16 @@ class Transformer(MAMPTransformer):
         reconstruction = (reconstruction * mask).sum() / mask.sum()
         contrastive = reconstruction.new_zeros(())
         if self.contrastive_weight:
-            contrastive = self.contrastive_loss(latent, keys, videos, people)
+            contrastive = self.contrastive_loss(latent, keys)
             if self.training:
                 self._pending_keys.append(keys.detach())
+        if dist.is_available() and dist.is_initialized():
+            # DDP averages rank gradients; weight by valid skeleton count.
+            total_skeletons = reconstruction.new_tensor(x.shape[0])
+            dist.all_reduce(total_skeletons)
+            weight = dist.get_world_size() * x.shape[0] / total_skeletons
+            reconstruction = reconstruction * weight
+            contrastive = contrastive * weight
         loss = reconstruction + self.contrastive_weight * contrastive
         self._metrics = dict(loss_reconstruction=reconstruction.detach(),
                              loss_contrastive=contrastive.detach())
