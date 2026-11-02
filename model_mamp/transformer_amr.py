@@ -1,10 +1,10 @@
-"""AMR first step: cross-attention decoder with the existing NAT target/loss."""
+"""Cross-attention decoding with independently sized NAT reconstruction targets."""
 import torch
 from torch import nn
 
 from .drop import DropPath
 from .transformer import MLP, trunc_normal_
-from .transformer_nat import Transformer as NATTransformer
+from .transformer_nat import Transformer as NATTransformer, normalize_reconstruction_target
 
 
 class CrossAttention(nn.Module):
@@ -52,9 +52,33 @@ class CrossAttentionBlock(nn.Module):
 
 
 class Transformer(NATTransformer):
-    def __init__(self, contrast_queue_size=8192, **kwargs):
+    def __init__(self, contrast_queue_size=8192, decoder_t_patch_size=None,
+                 loss_on_all_patches=False, focal_reconstruction=False,
+                 focal_window_size=4, focal_k=.01, cross_person_decoder=False, **kwargs):
         super().__init__(contrast_queue_size=contrast_queue_size, **kwargs)
+        self.decoder_t_patch_size = (
+            self.t_patch_size if decoder_t_patch_size is None else decoder_t_patch_size)
+        self.loss_on_all_patches = loss_on_all_patches
+        self.focal_reconstruction = focal_reconstruction
+        self.focal_window_size = focal_window_size
+        self.focal_k = focal_k
+        self.cross_person_decoder = cross_person_decoder
+        if cross_person_decoder and len(self.decoder_blocks) != 3:
+            raise ValueError('Cross-person decoding requires three decoder layers')
+        if focal_reconstruction and not loss_on_all_patches:
+            raise ValueError('Focal reconstruction requires loss_on_all_patches=True')
+        if focal_reconstruction and self.num_frames % focal_window_size:
+            raise ValueError('num_frames must be divisible by focal_window_size')
+        if self.num_frames % self.decoder_t_patch_size:
+            raise ValueError('num_frames must be divisible by decoder_t_patch_size')
         dim = self.decoder_embed.out_features
+        target_temporal = self.num_frames // self.decoder_t_patch_size
+        if self.decoder_t_patch_size != self.t_patch_size:
+            self.decoder_temp_embed = nn.Parameter(torch.zeros(1, target_temporal, 1, dim))
+            trunc_normal_(self.decoder_temp_embed, std=.02)
+            self.decoder_pred = nn.Linear(
+                dim, self.decoder_t_patch_size * self.patch_size * self.joints_embed.proj.in_channels)
+            self.decoder_pred.apply(self._init_weights)
         drop_rates = torch.linspace(
             0, kwargs.get('drop_path_rate', 0.), len(self.blocks)).tolist()
         self.decoder_blocks = nn.ModuleList([
@@ -70,16 +94,70 @@ class Transformer(NATTransformer):
         ])
         self.decoder_blocks.apply(self._init_weights)
         self.decoder_query = nn.Parameter(
-            torch.zeros(1, self.joints_embed.num_patches, dim))
+            torch.zeros(1, target_temporal * self.joints_embed.grid_size, dim))
         trunc_normal_(self.decoder_query, std=.02)
         del self.mask_token
 
-    def forward_decoder(self, latent, ids_restore):
+    def patchify_target(self, x):
+        batch, frames, joints, channels = x.shape
+        temporal = self.decoder_t_patch_size
+        spatial = self.patch_size
+        target = x.reshape(
+            batch, frames // temporal, temporal, joints // spatial, spatial, channels)
+        return target.permute(0, 1, 3, 2, 4, 5).reshape(
+            batch, (frames // temporal) * (joints // spatial), temporal * spatial * channels)
+
+    def make_reconstruction_target(self, x, motion_stride=1):
+        if self.reconstruction_target == 'motion':
+            x = self.extract_motion(x, motion_stride)
+        return normalize_reconstruction_target(
+            self.patchify_target(x), self.decoder_t_patch_size, self.patch_size,
+            x.shape[-1], self.target_normalization)
+
+    @torch.no_grad()
+    def focal_weights(self, x):
+        # AMR Eq. (3): population variance summed over xyz, before NAT.
+        batch, frames, joints, channels = x.shape
+        window_size = self.focal_window_size
+        windows = x.float().reshape(batch, frames // window_size, window_size, joints, channels)
+        centered = windows - windows.mean(dim=2, keepdim=True)
+        energy = centered.square().sum(dim=-1).mean(dim=2)
+        threshold = energy.mean(dim=(1, 2), keepdim=True)
+        weight = (energy + 1.e-6) / (energy + 1.e-6 + self.focal_k * threshold)
+        weight = weight.repeat_interleave(window_size, dim=1).unsqueeze(-1).expand_as(x)
+        return self.patchify_target(weight)
+
+    def reconstruction_loss(self, x, prediction, target, mask):
+        if self.loss_on_all_patches:
+            # Large targets mix visible and masked encoder patches.
+            error = (prediction - target) ** 2
+            if self.focal_reconstruction:
+                error = error * self.focal_weights(x)
+            return error.mean()
+        return super().reconstruction_loss(x, prediction, target, mask)
+
+    def decode_reconstruction(self, latent, ids_restore, valid_people):
+        partner_index = None
+        if self.cross_person_decoder:
+            if valid_people.shape[1] != 2:
+                raise ValueError('Cross-person decoding requires two person slots per video')
+            # Map original slots to packed rows before looking up the other person.
+            packed = torch.full(
+                valid_people.shape, -1, dtype=torch.long, device=latent.device)
+            own_index = torch.arange(latent.shape[0], device=latent.device)
+            packed[valid_people] = own_index
+            partner_index = packed.flip([1])[valid_people]
+            # A single valid person keeps its own memory in the middle layer.
+            partner_index = torch.where(partner_index >= 0, partner_index, own_index)
+        return self.forward_decoder(latent, ids_restore, partner_index)
+
+    def forward_decoder(self, latent, ids_restore, partner_index=None):
         # Memory remains connected to the encoder for reconstruction gradients.
         memory = self.decoder_embed(latent)
+        middle_memory = memory if partner_index is None else memory.index_select(0, partner_index)
         position = (self.decoder_temp_embed + self.decoder_pos_embed).flatten(1, 2)
         # Queries already follow the target's temporal/joint order.
         query = (self.decoder_query + position).expand(memory.shape[0], -1, -1)
-        for block in self.decoder_blocks:
-            query = block(query, memory)
+        for index, block in enumerate(self.decoder_blocks):
+            query = block(query, middle_memory if index == 1 else memory)
         return self.decoder_pred(self.decoder_norm(query))

@@ -130,6 +130,13 @@ class Transformer(MAMPTransformer):
             self.patchify(x), self.t_patch_size, self.patch_size,
             self.joints_embed.proj.in_channels, self.target_normalization)
 
+    def reconstruction_loss(self, x, prediction, target, mask):
+        reconstruction = ((prediction - target) ** 2).mean(dim=-1)
+        return (reconstruction * mask).sum() / mask.sum()
+
+    def decode_reconstruction(self, latent, ids_restore, valid_people):
+        return self.forward_decoder(latent, ids_restore)
+
     @torch.no_grad()
     def teacher_features(self, x):
         # Process full contexts before the online forward. With LayerNorm and
@@ -208,15 +215,15 @@ class Transformer(MAMPTransformer):
             raise ValueError('Reconstruction requires 0 < mask_ratio < 1')
         videos, channels, frames, joints, people = x.shape
         x = x.permute(0, 4, 2, 3, 1).contiguous().view(videos * people, frames, joints, channels)
-        x = x[x.ne(0).flatten(1).any(dim=1)]
+        valid_people = x.ne(0).flatten(1).any(dim=1).view(videos, people)
+        x = x[valid_people.flatten()]
         if x.shape[0] == 0:
             raise ValueError('Batch contains no valid skeletons')
         keys = self.teacher_features(x) if self.contrastive_weight else None
         target = self.make_reconstruction_target(x, motion_stride)
         latent, mask, ids_restore = self.forward_encoder(x, mask_ratio, motion_aware_tau)
-        prediction = self.forward_decoder(latent, ids_restore)
-        reconstruction = ((prediction - target) ** 2).mean(dim=-1)
-        reconstruction = (reconstruction * mask).sum() / mask.sum()
+        prediction = self.decode_reconstruction(latent, ids_restore, valid_people)
+        reconstruction = self.reconstruction_loss(x, prediction, target, mask)
         contrastive = reconstruction.new_zeros(())
         if self.contrastive_weight:
             contrastive = self.contrastive_loss(latent, keys)
